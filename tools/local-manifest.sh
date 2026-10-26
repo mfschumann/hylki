@@ -42,6 +42,7 @@ local = (
     "        skip:\n"
     "          - .git\n"
     "          - .flatpak-builder\n"
+    "          - build-dir\n"
     "          - dist\n"
     "          - target\n"
     "          - packaging/out\n"

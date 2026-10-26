@@ -28,3 +28,8 @@ cargo-sources.json
 co.hyprlab.Hylki.local.yml
 po/.build/
 __pycache__/
+
+# Flatpak local build: flatpak-builder's state/downloads and the build dir the
+# official build also uses (the app is staged into build-dir/files/)
+/.flatpak-builder/
+/build-dir/
