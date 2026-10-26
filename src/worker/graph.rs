@@ -827,6 +827,9 @@ pub(super) async fn run_graph(
                 // held: answer "not found" so the app can report the miss.
                 emit(WorkerEvent::Located { message_id: message_id.clone(), hit: None });
             }
+            MailRequest::SearchServer { query_id, folders, text } => {
+                graph_search(account_id, &account, cache.as_ref(), &state, query_id, folders, &text, &emit).await;
+            }
             // Graph reports no mailbox size or limit to the user it signs in.
             MailRequest::Quota => emit(WorkerEvent::Quota(None)),
             MailRequest::FindKeywords => {
@@ -2391,11 +2394,83 @@ async fn emit_graph_body_hits(
     emit(WorkerEvent::BodyHits { folder_id, hits });
 }
 
+/// The KQL for [`graph_search`]: the phrase in the subject, the sender or
+/// the body. A quote inside the phrase becomes a space, as it would end the
+/// term.
+fn graph_search_term(text: &str) -> String {
+    let q = text.replace('"', " ");
+    format!("\"subject:\\\"{q}\\\" OR from:\\\"{q}\\\" OR body:\\\"{q}\\\"\"")
+}
+
+/// Microsoft Graph's side of [`MailRequest::SearchServer`]: one `$search` over
+/// each folder's messages, answered with the hits' uids and the summaries of
+/// those the cache does not index yet.
+async fn graph_search(
+    account_id: u32,
+    account: &AccountConfig,
+    cache: Option<&Cache>,
+    state: &GraphState,
+    query_id: u64,
+    folders: Vec<(u32, String)>,
+    text: &str,
+    emit: &impl Fn(WorkerEvent),
+) {
+    let Some(token) = graph_token(account, emit).await else { return };
+    for (folder_id, path) in folders {
+        if !search_is_current(query_id) {
+            break;
+        }
+        let Some((_, gid)) = state.folders.get(&path).cloned() else { continue };
+        let url = format!(
+            "{GRAPH_BASE}/me/mailFolders/{gid}/messages?$search={}&{GRAPH_MSG_SELECT}&$top=250",
+            crate::percent::encode(&graph_search_term(text))
+        );
+        let t = token.clone();
+        let items = match blocking(move || graph_paged(&t, &url, SEARCH_HIT_LIMIT)).await {
+            Ok(items) => items,
+            Err(e) => {
+                tracing::warn!("search: Graph search of {path:?} failed: {e}");
+                continue;
+            }
+        };
+        let found: Vec<Message> = items
+            .iter()
+            .filter_map(|v| graph_message(v, account_id, folder_id).map(|(m, _)| m))
+            .collect();
+        let uids = search_hit_uids(found.iter().map(|m| m.uid).collect());
+        if uids.is_empty() {
+            continue;
+        }
+        // Graph already summarised every hit, so they all go to the list (which
+        // drops the ones its own snapshot holds); only the hits the cache did
+        // not index yet are stored, so they gain a cache id and stay searchable
+        // offline.
+        let missing: std::collections::HashSet<u32> =
+            unindexed_uids(cache, account_id, &path, &uids).into_iter().collect();
+        if let Some(c) = cache {
+            let fresh: Vec<Message> = found.iter().filter(|m| missing.contains(&m.uid)).cloned().collect();
+            c.upsert_messages(account_id, &path, &fresh);
+        }
+        emit(WorkerEvent::SearchHits { query_id, folder_id, uids, messages: found });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::graph_due;
 
     use super::*;
+
+    /// The `$search` term asks each of the three fields, each quoted, and a
+    /// quote of the user's becomes a space rather than ending the term.
+    #[test]
+    fn graph_search_term_covers_subject_sender_and_body() {
+        assert_eq!(
+            graph_search_term("Galaxy Watch7"),
+            r#""subject:\"Galaxy Watch7\" OR from:\"Galaxy Watch7\" OR body:\"Galaxy Watch7\"""#
+        );
+        assert_eq!(graph_search_term("a\"b"), r#""subject:\"a b\" OR from:\"a b\" OR body:\"a b\"""#);
+    }
 
     /// A Graph message summary as `/messages` lists it.
     fn graph_msg(id: &str, at: &str) -> serde_json::Value {

@@ -278,6 +278,12 @@ fn rowid_list(rowids: &[i64]) -> String {
     rowids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
 }
 
+/// UIDs written into a query as a literal list, as [`rowid_list`] writes
+/// rowids: integers, so they are safe to inline.
+fn uid_list(uids: &[u32]) -> String {
+    uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+}
+
 /// Most Message-IDs one cross-folder conversation lookup matches against. A
 /// thread's ancestry is short in practice, and the references half of that query
 /// is a scan — this keeps a pathological References header (some mailing lists
@@ -1004,6 +1010,24 @@ impl Cache {
         self.load_folder(account_id, folder_path, folder_id, &format!("ORDER BY ts DESC LIMIT {limit}"))
     }
 
+    /// The indexed messages at `uids`. A server search knows only the uids it
+    /// found; this supplies their summaries, including for mail the list's own
+    /// snapshot no longer holds. Ordered by UID descending, which is newest
+    /// first for IMAP.
+    pub fn load_messages_by_uids(
+        &self,
+        account_id: u32,
+        folder_path: &str,
+        folder_id: u32,
+        uids: &[u32],
+    ) -> Vec<Message> {
+        if uids.is_empty() {
+            return Vec::new();
+        }
+        let list = uid_list(uids);
+        self.load_folder(account_id, folder_path, folder_id, &format!("AND uid IN ({list}) ORDER BY uid DESC"))
+    }
+
     fn load_folder(&self, account_id: u32, folder_path: &str, folder_id: u32, order: &str) -> Vec<Message> {
         let run = || -> rusqlite::Result<Vec<Message>> {
             let mut stmt = self.conn.prepare(&format!(
@@ -1216,6 +1240,28 @@ impl Cache {
             let mut stmt = self.conn.prepare(
                 "SELECT uid FROM messages WHERE account_id = ?1 AND folder_path = ?2",
             )?;
+            let rows = stmt.query_map(params![account_id, folder_path], |row| row.get::<_, u32>(0))?;
+            rows.collect()
+        };
+        run().unwrap_or_default()
+    }
+
+    /// Which of `uids` are already indexed for a folder: the server's search
+    /// hits, so only the rest need fetching.
+    pub fn cached_uids_among(
+        &self,
+        account_id: u32,
+        folder_path: &str,
+        uids: &[u32],
+    ) -> std::collections::HashSet<u32> {
+        if uids.is_empty() {
+            return Default::default();
+        }
+        let list = uid_list(uids);
+        let run = || -> rusqlite::Result<std::collections::HashSet<u32>> {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT uid FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid IN ({list})"
+            ))?;
             let rows = stmt.query_map(params![account_id, folder_path], |row| row.get::<_, u32>(0))?;
             rows.collect()
         };

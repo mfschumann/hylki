@@ -647,6 +647,19 @@ pub struct MessageList {
     pool_folders: Rc<std::collections::HashMap<(u32, u32), PoolFolder>>,
     /// Which messages the search field filters over.
     scope: SearchScope,
+    /// The search generation the server's answers must belong to.
+    server_query_id: u64,
+    /// The messages the server found for the search in the field, by
+    /// `(account_id, folder_id, uid)`.
+    server_keys: Rc<std::collections::HashSet<(u32, u32, u32)>>,
+    /// The server's hits the source does not hold, as the server summarised them.
+    server_extra: Vec<Rc<Message>>,
+    /// Whether the current search has already been sent to the server. A
+    /// cross-folder search waits for the pool's folder list first.
+    server_search_sent: bool,
+    /// The pending pause before the server is asked, cancelled when typing
+    /// continues so only the last keystroke's search runs.
+    server_search_timer: Option<gtk::glib::SourceId>,
     /// The search scope's button and popover.
     scope_picker: Option<ScopePicker>,
     /// The search field widget, kept so a folder switch can clear its text.
@@ -1101,6 +1114,28 @@ impl ScopePicker {
     }
 }
 
+/// How long the search field waits after the last keystroke before the
+/// server is asked.
+const SERVER_SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// The shortest search the server is asked for.
+const SERVER_SEARCH_MIN_CHARS: usize = 3;
+
+/// Whether the lowercased search term `q` is in a message's subject, sender
+/// or preview: the search field's own check, before the server is asked.
+fn local_text_match(q: &str, m: &Message) -> bool {
+    m.subject.to_lowercase().contains(q)
+        || m.from_name.to_lowercase().contains(q)
+        || m.from_addr.to_lowercase().contains(q)
+        || m.preview.to_lowercase().contains(q)
+}
+
+/// Whether the search field lets `m` through: its own text, or the server
+/// having found the term in its body.
+fn text_or_server_match(q: &str, m: &Message, server: &std::collections::HashSet<(u32, u32, u32)>) -> bool {
+    q.is_empty() || local_text_match(q, m) || server.contains(&(m.account_id, m.folder_id, m.uid))
+}
+
 /// A folder of the cross-folder search pool, as its results show it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolFolder {
@@ -1434,6 +1469,12 @@ pub enum MessageListInput {
     /// Replace the cross-folder search pool (all folders, all accounts). Sent by
     /// the app when a search begins; cleared to empty when it ends.
     SetSearchPool(Vec<Message>, std::collections::HashMap<(u32, u32), PoolFolder>),
+    /// The pause after typing in the search field has run out for search
+    /// `query_id`: ask the server, unless a newer search has begun.
+    ServerSearchDue(u64),
+    /// The server's hits for search `query_id` in one folder, and the
+    /// summaries of those the cache did not hold.
+    ServerHits { query_id: u64, account_id: u32, folder_id: u32, uids: Vec<u32>, messages: Vec<Message> },
     /// The reader's selection: mirror whichever of these the list has rows for,
     /// so everything that acts on the list's selection acts on the messages the
     /// user pointed at. The reader is already showing them, so this must not
@@ -1638,6 +1679,9 @@ pub enum MessageListOutput {
     /// scope wider than this folder), so the app can supply or drop the
     /// cross-folder search pool.
     SearchActive(bool),
+    /// The search in the field, for the server to answer: `text` in the
+    /// subject, sender and body of these `(account_id, folder_id)` folders.
+    ServerSearch { query_id: u64, text: String, folders: Vec<(u32, u32)> },
     /// A column heading changed the sort (#334), by its key: the sort
     /// menus follow.
     SortChanged(&'static str),
@@ -1972,6 +2016,11 @@ impl SimpleComponent for MessageList {
             all: Vec::new(),
             search_pool: Vec::new(),
             pool_folders: Default::default(),
+            server_query_id: 0,
+            server_keys: Default::default(),
+            server_extra: Vec::new(),
+            server_search_sent: false,
+            server_search_timer: None,
             scope: SearchScope::AllFolders,
             search_entry: None,
             scope_picker: None,
@@ -2594,6 +2643,7 @@ impl SimpleComponent for MessageList {
             MessageListInput::Search(q) => {
                 let was_active = self.wants_pool();
                 self.query = q;
+                self.begin_server_search(&sender);
                 let now_active = self.wants_pool();
                 // On the empty↔non-empty edge, tell the app to supply or drop the
                 // cross-folder pool.
@@ -2610,6 +2660,9 @@ impl SimpleComponent for MessageList {
                 if self.scope != scope {
                     let was_active = self.wants_pool();
                     self.scope = scope;
+                    if self.searching() {
+                        self.begin_server_search(&sender);
+                    }
                     // "This folder" has no use for the pool, which can run to
                     // every message of every account (#472).
                     if was_active != self.wants_pool() {
@@ -2626,9 +2679,62 @@ impl SimpleComponent for MessageList {
             MessageListInput::SetSearchPool(pool, folders) => {
                 self.search_pool = pool.into_iter().map(Rc::new).collect();
                 self.pool_folders = Rc::new(folders);
+                // A hit that came back before the pool did is now part of it.
+                let known: std::collections::HashSet<(u32, u32, u32)> = self
+                    .search_pool
+                    .iter()
+                    .map(|m| (m.account_id, m.folder_id, m.uid))
+                    .collect();
+                self.server_extra.retain(|m| !known.contains(&(m.account_id, m.folder_id, m.uid)));
                 self.drop_threads();
                 self.sync_look();
                 if self.searching() && self.scope != SearchScope::ThisFolder {
+                    // The pool carries the folder list the server search needs,
+                    // so a search that was waiting for it starts now.
+                    if !self.server_search_sent {
+                        self.begin_server_search(&sender);
+                    }
+                    self.rebuild();
+                }
+            }
+            MessageListInput::ServerSearchDue(query_id) => {
+                if query_id == self.server_query_id {
+                    // The pause is over, so its timer has fired; nothing left
+                    // to cancel.
+                    self.server_search_timer = None;
+                    if self.searching() {
+                        let folders = self.server_search_folders();
+                        let pool_ready = self.scope == SearchScope::ThisFolder || !self.pool_folders.is_empty();
+                        if !folders.is_empty() && pool_ready {
+                            self.server_search_sent = true;
+                            let _ = sender.output(MessageListOutput::ServerSearch {
+                                query_id,
+                                text: self.query.trim().to_string(),
+                                folders,
+                            });
+                        }
+                    }
+                }
+            }
+            MessageListInput::ServerHits { query_id, account_id, folder_id, uids, messages } => {
+                if query_id == self.server_query_id {
+                    let mut keys = (*self.server_keys).clone();
+                    keys.extend(uids.into_iter().map(|uid| (account_id, folder_id, uid)));
+                    self.server_keys = Rc::new(keys);
+                    let mut known: std::collections::HashSet<(u32, u32, u32)> = self
+                        .active_source()
+                        .iter()
+                        .chain(self.server_extra.iter())
+                        .map(|m| (m.account_id, m.folder_id, m.uid))
+                        .collect();
+                    for m in messages {
+                        // Kept once: a later answer carrying the same message
+                        // (another folder's search, or a rebuilt pool) is not
+                        // added a second time.
+                        if known.insert((m.account_id, m.folder_id, m.uid)) {
+                            self.server_extra.push(Rc::new(m));
+                        }
+                    }
                     self.rebuild();
                 }
             }
@@ -4897,6 +5003,47 @@ impl MessageList {
         }
     }
 
+    /// Start the server's part of the search in the field: answers to any
+    /// earlier search are dropped from now on, and once the typing pauses the
+    /// server is asked (see `ServerSearchDue`).
+    fn begin_server_search(&mut self, sender: &ComponentSender<Self>) {
+        self.server_query_id = crate::worker::next_search_generation();
+        self.server_keys = Rc::default();
+        self.server_extra.clear();
+        self.server_search_sent = false;
+        // A newer search replaces the one still waiting out its pause.
+        if let Some(t) = self.server_search_timer.take() {
+            t.remove();
+        }
+        if self.query.trim().chars().count() < SERVER_SEARCH_MIN_CHARS {
+            return;
+        }
+        let query_id = self.server_query_id;
+        let input = sender.input_sender().clone();
+        self.server_search_timer = Some(gtk::glib::timeout_add_local_once(SERVER_SEARCH_DELAY, move || {
+            let _ = input.send(MessageListInput::ServerSearchDue(query_id));
+        }));
+    }
+
+    /// The `(account_id, folder_id)` folders the server is asked about: the
+    /// folders the list is showing for "This folder" (a smart or tag view can
+    /// span several), otherwise what the scope searches (Trash and Junk only
+    /// for "Everywhere", or when shown). An empty view asks about nothing.
+    fn server_search_folders(&self) -> Vec<(u32, u32)> {
+        let here: std::collections::HashSet<(u32, u32)> = self.all.iter().map(|m| (m.account_id, m.folder_id)).collect();
+        let mut folders: Vec<(u32, u32)> = if self.scope == SearchScope::ThisFolder || self.pool_folders.is_empty() {
+            here.iter().copied().collect()
+        } else {
+            self.pool_folders
+                .iter()
+                .filter(|(k, f)| self.scope == SearchScope::Everywhere || !f.waste || here.contains(k))
+                .map(|(k, _)| *k)
+                .collect()
+        };
+        folders.sort_unstable();
+        folders
+    }
+
     /// Drop any active search: clear the query and the entry text so a folder
     /// switch doesn't leave a stale term filtering the new folder.
     fn clear_search(&mut self, sender: &ComponentSender<Self>) {
@@ -4910,6 +5057,7 @@ impl MessageList {
             let _ = sender.output(MessageListOutput::SearchActive(false));
         }
         self.query.clear();
+        self.begin_server_search(sender);
         if let Some(e) = &self.search_entry {
             e.set_text("");
         }
@@ -4918,6 +5066,7 @@ impl MessageList {
     /// What the search field and the quick filters let through.
     fn filter(&self) -> impl Fn(&Message) -> bool {
         let q = self.query.to_lowercase();
+        let server = self.server_keys.clone();
         let quick = QuickFilterContext {
             filters: self.quick,
             own: if self.quick.has(QuickFilter::ToMe) { self.own_addresses.clone() } else { Default::default() },
@@ -4936,11 +5085,7 @@ impl MessageList {
         move |m: &Message| {
             !left_out.contains(&(m.account_id, m.folder_id))
                 && quick.passes(m)
-                && (q.is_empty()
-                    || m.subject.to_lowercase().contains(&q)
-                    || m.from_name.to_lowercase().contains(&q)
-                    || m.from_addr.to_lowercase().contains(&q)
-                    || m.preview.to_lowercase().contains(&q))
+                && text_or_server_match(&q, m, &server)
         }
     }
 
@@ -5208,8 +5353,14 @@ impl MessageList {
     /// the one that is.
     fn compute_rows(&mut self, offscreen: bool) -> Built {
         let passes = self.filter();
-        let source_len = self.active_source().len();
-        let mut matches: Vec<Rc<Message>> = self.active_source().iter().filter(|m| passes(m)).cloned().collect();
+        let source_len = self.active_source().len() + self.server_extra.len();
+        let mut matches: Vec<Rc<Message>> = self
+            .active_source()
+            .iter()
+            .chain(self.server_extra.iter())
+            .filter(|m| passes(m))
+            .cloned()
+            .collect();
         if self.searching() {
             tracing::debug!("list: search matched {} of {} messages ({:?})", matches.len(), source_len, self.scope);
         }
@@ -5763,6 +5914,7 @@ mod tests {
     use super::{
         column_sort, compute_thread_keys, correspondents, text_key_cmp, heads_its_row, message_cmp, SortOrder, latest_elsewhere, nested_members, reader_conversation,
         row_for_reader_key, thread_slot, unasked_threads, QuickFilter, QuickFilterContext, QuickFilters,
+        local_text_match, text_or_server_match,
     };
     use crate::ui::message_row::{row_edits, swap_wanted, swipe_progress_px, DaySection, RowData, RowEdit, SWIPE_ARM, SWIPE_MAX};
     use crate::models::Message;
@@ -6351,5 +6503,27 @@ mod tests {
         assert!(!ctx(all.with(QuickFilter::Unread, true).with(QuickFilter::Unread, false).with(QuickFilter::Attachment, true)).passes(&m));
         m.timestamp = 800;
         assert!(!ctx(all.with(QuickFilter::Today, true)).passes(&m));
+    }
+
+    /// The server's hits count even when the local subject, sender and
+    /// preview say nothing, and only for that exact message.
+    #[test]
+    fn server_hits_pass_the_text_search() {
+        let mut m = msg(7, "Order", "Your parcel is on its way");
+        m.subject = "Order".into();
+        m.preview = "Your parcel is on its way".into();
+        m.account_id = 2;
+        m.folder_id = 4;
+        m.uid = 99;
+        let none = std::collections::HashSet::new();
+        assert!(!text_or_server_match("galaxy watch7", &m, &none));
+        assert!(local_text_match("parcel", &m));
+        let mut keys = std::collections::HashSet::new();
+        keys.insert((2, 4, 99));
+        assert!(text_or_server_match("galaxy watch7", &m, &keys));
+        let mut other = std::collections::HashSet::new();
+        other.insert((2, 4, 98));
+        assert!(!text_or_server_match("galaxy watch7", &m, &other));
+        assert!(text_or_server_match("", &m, &none));
     }
 }

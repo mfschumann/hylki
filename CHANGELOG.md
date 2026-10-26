@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Added: the message search looks in message bodies on the server.** The
+  list still filters its own index at once (subject, sender and preview), and
+  after a one-second pause it asks the server for the same words in the
+  subject, sender and body of the folders the search covers. Server-only hits
+  are added to the list as they arrive, and an answer to an older search is
+  dropped when typing continues. IMAP, Microsoft 365 and JMAP accounts are
+  covered; POP3 has no server-side search.
+
 - **Fixed: a folder with a backslash in its name could not be opened**
   (#514, reported by 3v1n0). The server's escaping was kept in the name, so
   a Gmail label called `\All` showed as `\\All` and the server answered that

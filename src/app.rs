@@ -2217,6 +2217,11 @@ pub enum AppMsg {
     /// listed mail (#191): uid → the lowercased alternatives found in it.
     /// Arrives just ahead of the `Messages` it describes.
     BodyHits { account_id: u32, folder_id: u32, hits: std::collections::HashMap<u32, Vec<String>> },
+    /// The server's answer to the search in the field, for one folder (see
+    /// [`MailRequest::SearchServer`]).
+    SearchHits { account_id: u32, folder_id: u32, query_id: u64, uids: Vec<u32>, messages: Vec<Message> },
+    /// The search in the field is to be asked of the server in these folders.
+    ServerSearch { query_id: u64, text: String, folders: Vec<(u32, u32)> },
     /// Additional indexed summaries from the background backfill (search index).
     MessagesAppend { account_id: u32, folder_id: u32, messages: Vec<Message> },
     UndoRestored { account_id: u32, folder_id: u32, message_ids: Vec<String> },
@@ -3230,6 +3235,7 @@ impl SimpleComponent for AppModel {
                     MessageListOutput::SelectionCleared => AppMsg::ClearReader,
                     MessageListOutput::OpenedByKey { already_open } => AppMsg::OpenedByKey { already_open },
                     MessageListOutput::SearchActive(active) => AppMsg::SearchActive(active),
+                    MessageListOutput::ServerSearch { query_id, text, folders } => AppMsg::ServerSearch { query_id, text, folders },
                     MessageListOutput::SortChanged(key) => AppMsg::ListSortChanged(key),
                     MessageListOutput::ColumnWidths(widths) => AppMsg::ListColumnWidths(widths),
                     MessageListOutput::CustomizeColumns => AppMsg::CustomizeColumns,
@@ -11754,6 +11760,28 @@ impl SimpleComponent for AppModel {
                 // The whole answer for the sync about to land; the previous
                 // one described mail that sync lists again anyway.
                 self.body_hits.insert((account_id, folder_id), hits);
+            }
+
+            AppMsg::SearchHits { account_id, folder_id, query_id, uids, messages } => {
+                let messages = self.merge_local_tags(account_id, messages);
+                self.message_list.emit(MessageListInput::ServerHits { query_id, account_id, folder_id, uids, messages });
+            }
+
+            AppMsg::ServerSearch { query_id, text, folders } => {
+                let mut by_account: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
+                for (account_id, folder_id) in folders {
+                    let path = self
+                        .folders
+                        .get(&account_id)
+                        .and_then(|fs| fs.iter().find(|f| f.id == folder_id))
+                        .map(|f| f.path.clone());
+                    if let Some(path) = path {
+                        by_account.entry(account_id).or_default().push((folder_id, path));
+                    }
+                }
+                for (account_id, folders) in by_account {
+                    self.send_to(account_id, MailRequest::SearchServer { query_id, folders, text: text.clone() });
+                }
             }
 
             AppMsg::Messages { account_id, folder_id, messages } => {
@@ -27138,6 +27166,9 @@ fn map_event(account_id: u32, event: WorkerEvent) -> AppMsg {
             AppMsg::Messages { account_id, folder_id, messages }
         }
         WorkerEvent::BodyHits { folder_id, hits } => AppMsg::BodyHits { account_id, folder_id, hits },
+        WorkerEvent::SearchHits { query_id, folder_id, uids, messages } => {
+            AppMsg::SearchHits { account_id, folder_id, query_id, uids, messages }
+        }
         WorkerEvent::MessagesAppend { folder_id, messages } => {
             AppMsg::MessagesAppend { account_id, folder_id, messages }
         }

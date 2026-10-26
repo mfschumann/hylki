@@ -547,6 +547,49 @@ pub enum MailRequest {
     /// without the folder it sits in being opened. `keywords` are the
     /// configured tags. Answered with [`WorkerEvent::KeywordsSynced`].
     RefreshKeywords { keywords: Vec<String> },
+    /// The message list's search, asked of the server (#…): `text` in the
+    /// subject, sender or body of each `(folder id, path)`, answered per
+    /// folder with [`WorkerEvent::SearchHits`]. Skipped once a newer search
+    /// has begun (see [`next_search_generation`]).
+    SearchServer { query_id: u64, folders: Vec<(u32, String)>, text: String },
+}
+
+/// The search generation the message list is on. The list takes the next one
+/// as a search begins; a worker still running an older one sees the change and
+/// stops between folders, and the list drops any answer whose id is not the
+/// current one. Hylki has a single main window, so one counter serves every
+/// account's worker.
+static SEARCH_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Begin a new server search, making every older one stale. Returns its id.
+pub fn next_search_generation() -> u64 {
+    SEARCH_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+fn search_is_current(query_id: u64) -> bool {
+    SEARCH_GENERATION.load(std::sync::atomic::Ordering::Relaxed) == query_id
+}
+
+/// The most hits one folder's server search answers with.
+const SEARCH_HIT_LIMIT: usize = 1000;
+
+/// `uids` deduplicated and capped at [`SEARCH_HIT_LIMIT`], newest first. IMAP
+/// UIDs grow with time, so the cap keeps the newest; Graph and JMAP UIDs are
+/// hashes, where the order is arbitrary and the servers already cap their own
+/// answers, so there this only drops duplicates.
+fn search_hit_uids(mut uids: Vec<u32>) -> Vec<u32> {
+    uids.sort_unstable_by(|a, b| b.cmp(a));
+    uids.dedup();
+    uids.truncate(SEARCH_HIT_LIMIT);
+    uids
+}
+
+/// The `uids` the cache does not index for `path` yet.
+fn unindexed_uids(cache: Option<&Cache>, account_id: u32, path: &str, uids: &[u32]) -> Vec<u32> {
+    let known = cache
+        .map(|c| c.cached_uids_among(account_id, path, uids))
+        .unwrap_or_default();
+    uids.iter().copied().filter(|u| !known.contains(u)).collect()
 }
 
 /// A message composed by the user, ready to send.
@@ -633,6 +676,10 @@ pub enum WorkerEvent {
     /// alternatives it contains. Sent just ahead of the `Messages` it
     /// describes, and only for an inbox with body rules.
     BodyHits { folder_id: u32, hits: std::collections::HashMap<u32, Vec<String>> },
+    /// The server's answer to a [`MailRequest::SearchServer`] in one folder:
+    /// the matching `uids`, newest first, and the summaries of those the cache
+    /// did not index yet (now stored there too).
+    SearchHits { query_id: u64, folder_id: u32, uids: Vec<u32>, messages: Vec<Message> },
     /// Additional indexed message summaries for a folder, produced by the
     /// background backfill. Merged into the existing index without replacing it.
     MessagesAppend { folder_id: u32, messages: Vec<Message> },
@@ -1104,7 +1151,7 @@ fn is_list_load(req: &MailRequest) -> bool {
 /// Refresh ticks now only schedule idle work, so they are no longer a
 /// barrier between a reader and a folder sync already in the backlog.
 fn can_yield_to_reader(req: &MailRequest) -> bool {
-    is_list_load(req) || matches!(req, MailRequest::RefreshUnread)
+    is_list_load(req) || matches!(req, MailRequest::RefreshUnread | MailRequest::SearchServer { .. })
 }
 
 /// Take everything else already queued behind `first` and move the reader's
@@ -2541,6 +2588,48 @@ async fn run_imap(
                 let sess = session.as_mut().unwrap();
                 let paths = refresh_keywords(account_id, sess, cache.as_ref(), &keywords).await;
                 emit(WorkerEvent::KeywordsSynced { paths });
+            }
+            MailRequest::SearchServer { query_id, folders, text } => {
+                if search_is_current(query_id) {
+                    let sess = session.as_mut().unwrap();
+                    let query = imap_search_query(&text);
+                    for (folder_id, path) in folders {
+                        if !search_is_current(query_id) {
+                            break;
+                        }
+                        if let Err(e) = sel(sess, &path).await {
+                            tracing::warn!("search: select {path:?} failed: {e}");
+                            continue;
+                        }
+                        let found = match search_uids(sess, &query).await {
+                            Ok(found) => found,
+                            Err(e) => {
+                                tracing::warn!("search: IMAP search of {path:?} failed: {e}");
+                                continue;
+                            }
+                        };
+                        let uids = search_hit_uids(found.into_iter().collect());
+                        if uids.is_empty() {
+                            continue;
+                        }
+                        let missing = unindexed_uids(cache.as_ref(), account_id, &path, &uids);
+                        let mut messages = cache
+                            .as_ref()
+                            .map(|c| c.load_messages_by_uids(account_id, &path, folder_id, &uids))
+                            .unwrap_or_default();
+                        let fetched = fetch_summaries_by_uid(account_id, sess, folder_id, &path, &missing, use_envelope).await;
+                        match fetched {
+                            Ok(fetched) => {
+                                if let Some(c) = cache.as_ref() {
+                                    c.upsert_messages(account_id, &path, &fetched);
+                                }
+                                messages.extend(fetched);
+                            }
+                            Err(e) => tracing::warn!("search: summaries for {path:?} failed: {e}"),
+                        }
+                        emit(WorkerEvent::SearchHits { query_id, folder_id, uids, messages });
+                    }
+                }
             }
 
             MailRequest::UndoMove { path, dest, dest_folder_id, message_ids } => {
@@ -7791,9 +7880,24 @@ fn is_inbox_path(cache: Option<&Cache>, account_id: u32, path: &str) -> bool {
 /// quoted string, and line breaks can never be in a quoted string at all.
 fn body_search_query(set: &str, needle: &str) -> String {
     let clean: String = needle.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
-    let quoted = clean.replace('\\', "\\\\").replace('"', "\\\"");
     let charset = if clean.is_ascii() { "" } else { "CHARSET UTF-8 " };
-    format!("{charset}UID {set} BODY \"{quoted}\"")
+    format!("{charset}UID {set} BODY {}", imap_quoted(&clean))
+}
+
+/// The keys of a whole-folder search for `text` in the subject, the sender
+/// or the body (the message list's search, asked of the server). Built from
+/// the same pieces as [`body_search_query`]; `OR` takes two keys, so the three
+/// fields nest as `OR OR SUBJECT x FROM x BODY x`.
+fn imap_search_query(text: &str) -> String {
+    let clean: String = text.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+    let charset = if clean.is_ascii() { "" } else { "CHARSET UTF-8 " };
+    let q = imap_quoted(&clean);
+    format!("{charset}OR OR SUBJECT {q} FROM {q} BODY {q}")
+}
+
+/// `s` as an IMAP quoted string: backslashes and quotes escaped.
+fn imap_quoted(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn cached_folder_kind(cache: Option<&Cache>, account_id: u32, path: &str) -> Option<FolderKind> {
@@ -10147,6 +10251,8 @@ async fn run_pop3(
                 // held: answer "not found" so the app can report the miss.
                 emit(WorkerEvent::Located { message_id: message_id.clone(), hit: None });
             }
+            // POP3 has no server-side search: the local results stand.
+            MailRequest::SearchServer { .. } => {}
             // POP3 downloads every message in full, so an attachment is either
             // already in the cache or does not exist: there is nothing a scan
             // could add.
@@ -10599,6 +10705,8 @@ async fn run_mock(
                 // held: answer "not found" so the app can report the miss.
                 emit(WorkerEvent::Located { message_id: message_id.clone(), hit: None });
             }
+            // The demo's mail is already all in memory; nothing to ask a server.
+            MailRequest::SearchServer { .. } => {}
             // Demo mode seeds its in-memory cache up front (see
             // `backend::seed_demo_cache`), so every attachment is already
             // described and there is nothing to ask a server about.
@@ -14273,6 +14381,37 @@ NIL NIL NIL NIL NIL NIL NIL))\r\n";
         assert_eq!(body_search_query("1", r#"say "hi" \now"#), r#"UID 1 BODY "say \"hi\" \\now""#);
         assert_eq!(body_search_query("1", "café"), r#"CHARSET UTF-8 UID 1 BODY "café""#);
         assert_eq!(body_search_query("1", "a\r\nb"), r#"UID 1 BODY "ab""#);
+    }
+
+    #[test]
+    fn imap_search_query_covers_subject_sender_and_body() {
+        assert_eq!(
+            imap_search_query("Galaxy Watch7"),
+            r#"OR OR SUBJECT "Galaxy Watch7" FROM "Galaxy Watch7" BODY "Galaxy Watch7""#
+        );
+        assert_eq!(
+            imap_search_query("café"),
+            r#"CHARSET UTF-8 OR OR SUBJECT "café" FROM "café" BODY "café""#
+        );
+        assert_eq!(imap_search_query("a\"b\r\n"), r#"OR OR SUBJECT "a\"b" FROM "a\"b" BODY "a\"b""#);
+    }
+
+    #[test]
+    fn search_hits_are_newest_first_and_capped() {
+        assert_eq!(search_hit_uids(vec![3, 9, 9, 1]), vec![9, 3, 1]);
+        let many: Vec<u32> = (1..=SEARCH_HIT_LIMIT as u32 + 5).collect();
+        let kept = search_hit_uids(many);
+        assert_eq!(kept.len(), SEARCH_HIT_LIMIT);
+        assert_eq!(kept[0], SEARCH_HIT_LIMIT as u32 + 5);
+    }
+
+    #[test]
+    fn only_the_latest_search_generation_is_current() {
+        let first = next_search_generation();
+        assert!(search_is_current(first));
+        let second = next_search_generation();
+        assert!(!search_is_current(first));
+        assert!(search_is_current(second));
     }
 
     #[test]

@@ -1625,6 +1625,16 @@ several labels is one result: its Inbox copy, else a label's, else All
 Mail's. Folders not opened since Hylki started are searched from the index
 Hylki keeps of them, which covers mail archived to Gmail's All Mail.
 
+The list answers at once from that index, then, after a one-second pause in
+typing, asks the server too: the words are looked for in the subject, the
+sender and the **body** of each message in the chosen folders. Results found
+only on the server appear in the list as they arrive; mail already on screen
+is not repeated. If you type again, the previous server answer is dropped.
+POP3 accounts have no server-side search, so there only the local list is
+searched. A body phrase split across an HTML tag or encoded by the server's
+MIME transfer encoding may not be found by the server's own search; the
+message is still found when its subject or sender matches.
+
 The sort and filter button in the list's header opens a popover of two
 columns. **Sort by** orders the list by date, newest or oldest first, by
 sender or subject, or puts unread or starred mail first. **Show only** holds

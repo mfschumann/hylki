@@ -1529,6 +1529,78 @@ async fn emit_jmap_body_hits(
     emit(WorkerEvent::BodyHits { folder_id, hits });
 }
 
+/// The `Email/query` filter for [`jmap_search`]: the mailbox, and the text in
+/// the subject, the sender or the body.
+fn jmap_search_filter(mailbox_id: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "operator": "AND",
+        "conditions": [
+            { "inMailbox": mailbox_id },
+            { "operator": "OR", "conditions": [
+                { "subject": text },
+                { "from": text },
+                { "body": text }
+            ] }
+        ]
+    })
+}
+
+/// JMAP's side of [`MailRequest::SearchServer`]: one `Email/query` per folder,
+/// answered with the hits' uids and the summaries of those the cache does not
+/// index yet.
+async fn jmap_search(
+    account_id: u32,
+    s: &JmapSession,
+    cache: Option<&Cache>,
+    state: &JmapState,
+    query_id: u64,
+    folders: Vec<(u32, String)>,
+    text: &str,
+    emit: &impl Fn(WorkerEvent),
+) {
+    for (folder_id, path) in folders {
+        if !search_is_current(query_id) {
+            break;
+        }
+        let Some((_, mailbox_id)) = state.folders.get(&path).cloned() else { continue };
+        let filter = jmap_search_filter(&mailbox_id, text);
+        let sess = s.clone();
+        let ids = match blocking(move || jmap_query_ids(&sess, filter, SEARCH_HIT_LIMIT)).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!("search: JMAP search of {path:?} failed: {e}");
+                continue;
+            }
+        };
+        let by_uid: HashMap<u32, String> = ids.iter().map(|id| (hash_uid(id), id.clone())).collect();
+        let uids = search_hit_uids(by_uid.keys().copied().collect());
+        if uids.is_empty() {
+            continue;
+        }
+        let missing_ids: Vec<String> = unindexed_uids(cache, account_id, &path, &uids)
+            .iter()
+            .filter_map(|u| by_uid.get(u).cloned())
+            .collect();
+        let mut messages = cache
+            .map(|c| c.load_messages_by_uids(account_id, &path, folder_id, &uids))
+            .unwrap_or_default();
+        if !missing_ids.is_empty() {
+            let sess = s.clone();
+            match blocking(move || jmap_get_messages(&sess, &missing_ids, account_id, folder_id)).await {
+                Ok(got) => {
+                    let fetched: Vec<Message> = got.into_iter().map(|(m, _, _)| m).collect();
+                    if let Some(c) = cache {
+                        c.upsert_messages(account_id, &path, &fetched);
+                    }
+                    messages.extend(fetched);
+                }
+                Err(e) => tracing::warn!("search: JMAP summaries for {path:?} failed: {e}"),
+            }
+        }
+        emit(WorkerEvent::SearchHits { query_id, folder_id, uids, messages });
+    }
+}
+
 /// Auto-empty (#140): destroy whatever in Junk / Trash is older than the
 /// account's chosen age.
 async fn auto_empty_jmap(
@@ -2375,6 +2447,11 @@ pub(super) async fn run_jmap(
         // A folder the user opened, rather than a background refresh.
         let user = matches!(req, MailRequest::LoadMessages { .. });
         match req {
+            MailRequest::SearchServer { query_id, folders, text } => {
+                if let Some(s) = jmap_session(&account, &mut state, &emit).await {
+                    jmap_search(account_id, &s, cache.as_ref(), &state, query_id, folders, &text, &emit).await;
+                }
+            }
             MailRequest::Locate { message_id } => {
                 // The cache first, as on IMAP: every folder listing went
                 // through it. Then a header filter on the server, which finds
@@ -3053,6 +3130,25 @@ pub(super) async fn run_jmap(
 
 #[cfg(test)]
 mod tests {
+    /// The search filter asks the mailbox, and the three fields OR-ed.
+    #[test]
+    fn jmap_search_filter_covers_subject_sender_and_body() {
+        assert_eq!(
+            super::jmap_search_filter("MB", "Galaxy Watch7"),
+            serde_json::json!({
+                "operator": "AND",
+                "conditions": [
+                    { "inMailbox": "MB" },
+                    { "operator": "OR", "conditions": [
+                        { "subject": "Galaxy Watch7" },
+                        { "from": "Galaxy Watch7" },
+                        { "body": "Galaxy Watch7" }
+                    ] }
+                ]
+            })
+        );
+    }
+
     /// #414: lone LFs become CRLF; CRLFs stay as they are.
     #[test]
     fn submission_bytes_get_crlf_line_endings() {
